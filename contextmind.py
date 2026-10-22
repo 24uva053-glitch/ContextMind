@@ -35,6 +35,9 @@ SYSTEM_APPS = ("helpandtips.exe", "werfault.exe", "rundll32.exe", "unknown", "ta
                "systemsettings.exe", "py.exe", "python.exe", "pythonw.exe", "contextmind.exe", IDLE)
 SYS_CLAUSE = "LOWER(app) NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
 MAX_FAILS, LOCK_SECS = 5, 60
+SHOW_EVENT_NAME = "Local\\ContextMindShowWindow"
+_show_event = None                  # Windows event: second launch signal
+_wait_fn = None                     # WaitForSingleObject, set up in acquire_single_instance
 PRIVACY_NOTE = "\nThis file contains window titles. Keep it private."
 
 if IS_WIN:
@@ -494,6 +497,7 @@ class App(tk.Tk):
         else:
             self.after(900, self.first_run_prompt)
         self.after(2000, self.tick)
+        self.after(500, self.poll_show)
 
     @staticmethod
     def load_json(text):
@@ -580,8 +584,7 @@ class App(tk.Tk):
         self.stat["Tracked today"].config(text=fmt_secs(sum(r[1] for r in rows)))
         self.stat["Idle today"].config(text=fmt_secs(idle[0][0] if idle else 0))
         self.stat["Apps used today"].config(text=str(len(rows)))
-        self.stat["Last active app"].config(
-            text="Paused" if t.paused else ("Idle" if t.is_idle else t.current[0]))
+        self.stat["Last active app"].config(text="Paused" if t.paused else ("Idle" if t.is_idle else t.current[0]))
         self.status.config(text="Tracking: " + ("PAUSED" if t.paused else "ON"))
         self.pause_btn.config(text="Start tracking" if t.paused else "Pause tracking")
 
@@ -714,8 +717,8 @@ class App(tk.Tk):
     def build_history(self, f):
         today = date.today().isoformat()
         self.h_from, self.h_to, self.h_app = tk.StringVar(value=today), tk.StringVar(value=today), tk.StringVar()
-        self.filter_row(f, [("From (YYYY-MM-DD)", self.h_from), ("To", self.h_to),
-                            ("App contains", self.h_app)], self.load_history)
+        self.filter_row(f, [("From (YYYY-MM-DD)", self.h_from), ("To", self.h_to), ("App contains", self.h_app)],
+                        self.load_history)
         self.h_total = ttk.Label(f, text="", style="H.TLabel")
         self.h_total.pack(anchor="w", padx=12)
         self.h_tree = ttk.Treeview(f, columns=("day", "app", "time"), show="headings")
@@ -773,8 +776,7 @@ class App(tk.Tk):
         self.pause_btn.pack(side="left")
         ttk.Label(row, text="   Mark as idle after (minutes):").pack(side="left")
         self.idle_var = tk.IntVar(value=int(self.db.get("idle_minutes", "3")))
-        ttk.Spinbox(row, from_=1, to=60, width=4, textvariable=self.idle_var,
-                    command=self.set_idle).pack(side="left", padx=4)
+        ttk.Spinbox(row, from_=1, to=60, width=4, textvariable=self.idle_var, command=self.set_idle).pack(side="left", padx=4)
         self.idle_var.trace_add("write", lambda *a: self.set_idle())
         self.autostart_var = tk.BooleanVar(value=self.db.get("autostart") == "1")
         ttk.Checkbutton(f, text="Start ContextMind when Windows starts", variable=self.autostart_var,
@@ -814,8 +816,7 @@ class App(tk.Tk):
             ttk.Button(row, text=text, command=cmd).pack(side="left", padx=(0, 6))
         ttk.Label(f, text="Exports and backups contain window titles. Keep them private.",
                   foreground="#b03040").pack(**pad)
-        ttk.Label(f, text="Window X button minimizes the app (tracking continues).",
-                  foreground="#7a6a9a").pack(**pad)
+        ttk.Label(f, text="Window X button minimizes the app (tracking continues).", foreground="#7a6a9a").pack(**pad)
         ttk.Button(f, text="Exit ContextMind completely", command=self.quit_app).pack(**pad)
         ttk.Label(f, text="Data folder: " + DATA_DIR, foreground="#7a6a9a").pack(**pad)
 
@@ -980,8 +981,7 @@ class App(tk.Tk):
                         "SELECT day, app, seconds FROM usage ORDER BY day, app")
 
     def export_checkpoints(self):
-        self.export_csv("contextmind_checkpoints.csv",
-                        ["id", "time", "project", "note", "next_step", "context"],
+        self.export_csv("contextmind_checkpoints.csv", ["id", "time", "project", "note", "next_step", "context"],
                         "SELECT id, ts, project, note, next_step, context FROM checkpoints")
 
     def export_files(self):
@@ -1035,6 +1035,21 @@ class App(tk.Tk):
         finally:
             self.after(2000, self.tick)
 
+    def poll_show(self):
+        """Second launch signal vandhaa window-ah front-ku kondu varum. Lock screen-ah bypass pannaadhu."""
+        try:
+            if _show_event is not None and _wait_fn is not None and _wait_fn(_show_event, 0) == 0:
+                if self.lock_win is not None:
+                    self.lock_win.lift()  # password illama lock thaandi poga mudiyaadhu
+                else:
+                    self.deiconify()
+                    self.lift()
+                    self.focus_force()
+        except tk.TclError:
+            pass
+        finally:
+            self.after(500, self.poll_show)
+
     def quit_app(self):
         if messagebox.askyesno(APP, "Exit ContextMind? Tracking will stop."):
             self.tracker.save_snapshot()
@@ -1048,15 +1063,33 @@ def setup_logging():
     logging.basicConfig(filename=LOG_PATH, level=logging.ERROR, format="%(asctime)s %(message)s")
 
 
-def acquire_single_instance():
-    """True if this is the only running ContextMind (named Windows mutex)."""
+def acquire_single_instance(minimized=False):
+    """True = naan dhaan first. Already running na, running window-ah front-ku kondu vara signal anuppum."""
+    global _show_event, _wait_fn
     if not IS_WIN:
         return True
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = wt.HANDLE
     k32.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
+    k32.OpenEventW.restype = wt.HANDLE
+    k32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
+    k32.CreateEventW.restype = wt.HANDLE
+    k32.CreateEventW.argtypes = [wt.LPVOID, wt.BOOL, wt.BOOL, wt.LPCWSTR]
+    k32.SetEvent.argtypes = [wt.HANDLE]
+    k32.WaitForSingleObject.restype = wt.DWORD
+    k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    k32.CloseHandle.argtypes = [wt.HANDLE]
     k32.CreateMutexW(None, False, "Local\\ContextMindSingleInstance")
-    return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: app already running
+        if not minimized:  # autostart-la window pop aaga koodadhu
+            ev = k32.OpenEventW(0x0002, False, SHOW_EVENT_NAME)  # EVENT_MODIFY_STATE
+            if ev:
+                k32.SetEvent(ev)
+                k32.CloseHandle(ev)
+        return False
+    _show_event = k32.CreateEventW(None, False, False, SHOW_EVENT_NAME)  # auto-reset event
+    _wait_fn = k32.WaitForSingleObject
+    return True
 
 
 def report_crash(text):
@@ -1076,10 +1109,8 @@ def report_crash(text):
 
 def main():
     setup_logging()
-    if not acquire_single_instance():
-        if IS_WIN and "--minimized" not in sys.argv:
-            ctypes.windll.user32.MessageBoxW(None, "ContextMind is already running.", APP, 0x40)
-        return
+    if not acquire_single_instance("--minimized" in sys.argv):
+        return  # running app-ku signal anuppitaachu, puthu window venam
     App(start_minimized="--minimized" in sys.argv).mainloop()
 
 
