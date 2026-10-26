@@ -19,7 +19,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pyinstaller pillow
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
       - name: Find contextmind.py
         shell: pwsh
@@ -43,5 +47,7 @@ jobs:
         with:
           files: dist/ContextMind.exe
           tag_name: v${{ github.run_number }}
+          name: ContextMind v${{ github.run_number }}
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
