@@ -301,6 +301,7 @@ class Tracker(threading.Thread):
         self.remind_due = False
         self.resume_event = None
         self.session_ring = deque(maxlen=3)
+        self.last_session_save = 0.0
     def stop(self):
         self.stop_flag.set()
     def run(self):
@@ -317,6 +318,9 @@ class Tracker(threading.Thread):
                 logging.exception("tracker step")
     def step(self, dt, now):
         day = date.today().isoformat()
+        if now - self.last_session_save >= 10:
+            self.last_session_save = now
+            self.save_session()
         idle = idle_seconds()
         self.is_idle = idle > self.idle_limit
         if self.is_idle:
@@ -369,10 +373,13 @@ class Tracker(threading.Thread):
             self.db.set("last_active", json.dumps(snap))
             self.save_session()
     def save_session(self):
-        apps = [a for a in visible_apps() if a["app"].lower() not in NO_RESTORE]
-        if apps:
-            self.session_ring.append(apps)
-            self.db.set("session_ring", json.dumps(list(self.session_ring)))
+        try:
+            apps = [a for a in visible_apps() if a["app"].lower() not in NO_RESTORE]
+            if apps:
+                self.session_ring.append(apps)
+                self.db.set("session_ring", json.dumps(list(self.session_ring)))
+        except Exception:
+            logging.exception("save_session")
 
 
 class LockScreen(tk.Toplevel):
@@ -608,6 +615,8 @@ class App(tk.Tk):
             self.load_history()
         elif current == str(self.tabs["Files Used"]):
             self.load_files()
+        elif current == str(self.tabs["Features"]):
+            self.update_session_info()
     def build_dashboard(self, f):
         cards = ttk.Frame(f)
         cards.pack(fill="x", padx=10, pady=10)
@@ -1131,6 +1140,8 @@ class App(tk.Tk):
         ttk.Checkbutton(f, text="After a restart, offer to reopen the programs I was using",
                         variable=self.restore_var, command=self.save_features).pack(**pad)
         ttk.Button(f, text="Restore previous session now", command=lambda: self.offer_restore(force=True)).pack(**pad)
+        self.session_info = ttk.Label(f, text="", foreground="#7a6a9a", justify="left")
+        self.session_info.pack(**pad)
         ttk.Label(f, text="Programs are reopened only after you unlock and approve them. File names and tabs are\n"
                           "not restored by ContextMind: VS Code and Chrome reopen their own last workspace and tabs.",
                   foreground="#7a6a9a", justify="left").pack(**pad)
@@ -1145,12 +1156,20 @@ class App(tk.Tk):
         self.db.set("restore_on", int(self.restore_var.get()))
         self.tracker.remind_on = self.remind_var.get()
         self.tracker.remind_secs = minutes * 60
+    def update_session_info(self):
+        now = pick_session(self.db.get("session_ring"))
+        names = ", ".join(a["app"] for a in now[:6]) or "none"
+        self.session_info.config(text="Saved now: %d program(s) (%s)\nFrom the previous start: %d program(s), "
+                                      "%d can be restored" % (len(now), names, len(self.prev_session),
+                                                              len(restorable(self.prev_session))))
     def popup(self, title, attr):
         win = tk.Toplevel(self)
         win.title(title)
         win.configure(bg=T["bg"])
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        win.lift()
+        win.after(150, lambda: win.winfo_exists() and win.focus_force())
         setattr(self, attr, win)
         def close():
             setattr(self, attr, None)
@@ -1222,8 +1241,12 @@ class App(tk.Tk):
         apps = restorable(self.prev_session)[:15]
         if not apps:
             if force:
-                messagebox.showinfo(APP, "Nothing to restore. The programs of the previous session are already open "
-                                         "or no session was saved.")
+                if not self.prev_session:
+                    msg = "No previous session was saved. Open some programs, wait 15 seconds, then restart the PC."
+                else:
+                    msg = ("The %d program(s) of the previous session are already open or their files are missing."
+                           % len(self.prev_session))
+                messagebox.showinfo(APP, msg)
             return
         win, close = self.popup("Restore last session?", "restore_win")
         tk.Label(win, text="Restore your last session?", bg=ACCENT, fg="white", font=("Segoe UI", 12, "bold"),
