@@ -8,14 +8,15 @@ Sections:
   5. Lock screen (password, lockout countdown, last activity)
   6. Main window (dashboard, checkpoints, history, files, settings)
   7. Startup (single instance, logging, crash report)
+Extra features: dark mode, usage chart, break reminder, history search, resume popup, auto-restore.
 Data folder: %APPDATA%\\ContextMind
 """
-import os, sys, re, csv, json, math, time, sqlite3, hashlib, logging, secrets, threading, traceback, ctypes
+import os, sys, re, csv, json, math, time, sqlite3, hashlib, logging, secrets, threading, traceback, ctypes, subprocess
 # Windows data types (HWND, DWORD, ...) needed for calling the Windows API.
 from ctypes import wintypes as wt
 # Counter counts words for TF-IDF; deque keeps a fixed-size list of recent windows.
 from collections import Counter, deque
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 # Tkinter is the GUI library used for every window, button and label.
 import tkinter as tk
 # ttk gives themed widgets, messagebox gives popups, filedialog gives the save dialog.
@@ -40,6 +41,13 @@ DB_PATH = os.path.join(DATA_DIR, "contextmind.db")
 LOG_PATH = os.path.join(DATA_DIR, "contextmind.log")
 # Purple UI color theme: background, accent, dark, light, pink.
 BG, ACCENT, DARK, LIGHT, PINK = "#f3eefc", "#6c3fc5", "#2e1a5c", "#e4d9f7", "#ff9aa2"
+# Main window colors in light and dark mode. T always holds the active palette.
+# (The lock screen keeps the fixed purple colors above.)
+LIGHT_T = dict(bg="#f3eefc", fg="#2e1a5c", card="#ffffff", light="#e4d9f7", btn="#dcdad5",
+               accent_fg="#6c3fc5", accent_active="#2e1a5c")
+DARK_T = dict(bg="#1c1630", fg="#ece6fa", card="#2a2145", light="#3a2f5c", btn="#3a2f5c",
+              accent_fg="#b79cf2", accent_active="#8a63e0")
+T = dict(LIGHT_T)
 # Idle time is stored in its own bucket with this name.
 IDLE = "idle"
 # The app itself must never be tracked as user activity.
@@ -49,6 +57,11 @@ SYSTEM_APPS = ("helpandtips.exe", "werfault.exe", "rundll32.exe", "unknown", "ta
                "systemsettings.exe", "py.exe", "python.exe", "pythonw.exe", "contextmind.exe", IDLE)
 # Reusable SQL snippet "LOWER(app) NOT IN (?,?,?,...)" that excludes the system apps above.
 SYS_CLAUSE = "LOWER(app) NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
+# Programs that are never offered for restore (Windows shell, system helpers and this app).
+RESTORE_SKIP = {"explorer.exe", "applicationframehost.exe", "textinputhost.exe", "searchhost.exe",
+                "startmenuexperiencehost.exe", "shellexperiencehost.exe", "lockapp.exe", "snippingtool.exe",
+                "systemsettings.exe", "taskmgr.exe", "cmd.exe", "conhost.exe", "widgets.exe"}
+NO_RESTORE = OWN_APPS | RESTORE_SKIP | set(SYSTEM_APPS)
 # After 5 wrong passwords the lock screen is blocked for 60 seconds.
 MAX_FAILS, LOCK_SECS = 5, 60
 # Name of the Windows event used to signal the running app when a second copy is launched.
@@ -71,6 +84,21 @@ if IS_WIN:
     kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
     kernel32.CloseHandle.argtypes = [wt.HANDLE]
     kernel32.GetTickCount.restype = wt.DWORD
+    # Extra declarations used to list the open program windows (auto-restore feature).
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
+    user32.IsWindowVisible.argtypes = [wt.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+    user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+    user32.GetWindow.restype = wt.HWND
+    try:
+        # Used to ignore hidden (cloaked) windows such as suspended Store apps.
+        dwmapi = ctypes.windll.dwmapi
+        dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+    except (OSError, AttributeError):
+        dwmapi = None
 
     # C structure expected by Windows. It holds the time of the last keyboard or mouse input.
     class LASTINPUTINFO(ctypes.Structure):
@@ -111,6 +139,47 @@ if IS_WIN:
     def lock_windows():
         # Locks the Windows session, same as pressing Win + L.
         user32.LockWorkStation()
+
+    def exe_path(pid):
+        """Full path of the program file that owns a process id, or an empty string."""
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        name, size = ctypes.create_unicode_buffer(1024), wt.DWORD(1024)
+        ok = kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size))
+        kernel32.CloseHandle(handle)
+        return name.value if ok else ""
+
+    def visible_apps():
+        """Open program windows as [{exe, app, title}], one entry per program, with the full exe path."""
+        found, seen = [], set()
+
+        def callback(hwnd, _):
+            try:
+                if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
+                    return True
+                # Skip tool windows (0x80) and windows that belong to another window.
+                if user32.GetWindowLongW(hwnd, -20) & 0x80 or user32.GetWindow(hwnd, 4):
+                    return True
+                if dwmapi is not None:
+                    cloaked = wt.DWORD(0)
+                    if dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked),
+                                                    ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                        return True
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, 512)
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                path = exe_path(pid.value)
+                if path and path.lower() not in seen:
+                    seen.add(path.lower())
+                    found.append({"exe": path, "app": os.path.basename(path), "title": title.value})
+            except Exception:
+                logging.exception("visible_apps")
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(callback), 0)
+        return found
 else:
     # Dummy versions so the file can be tested on non-Windows systems.
     def foreground():
@@ -121,6 +190,9 @@ else:
 
     def lock_windows():
         pass
+
+    def visible_apps():
+        return []
 
 
 def fmt_secs(seconds):
@@ -153,6 +225,31 @@ def ago(iso):
 def clear_tree(tree):
     # Removes every row from a Treeview table.
     tree.delete(*tree.get_children())
+
+
+def pick_session(text):
+    """From the saved list of recent snapshots, returns the one with the most programs.
+    Windows closes programs one by one at shutdown, so the fullest recent snapshot is the best one."""
+    try:
+        ring = json.loads(text) if text else []
+    except ValueError:
+        return []
+    ring = [s for s in ring if isinstance(s, list)] if isinstance(ring, list) else []
+    return max(ring, key=len, default=[])
+
+
+def restorable(session):
+    """Programs from a saved session that are not running now and still exist on disk."""
+    running = {a["exe"].lower() for a in visible_apps()}
+    out, seen = [], set()
+    for item in session:
+        exe = item.get("exe", "")
+        low = exe.lower()
+        if not exe or low in running or low in seen or not os.path.isfile(exe):
+            continue
+        seen.add(low)
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------- 2. Database
@@ -326,6 +423,15 @@ class Tracker(threading.Thread):
         self.was_idle, self.idle_started = False, 0.0
         # Seconds collected since the last snapshot save.
         self.unsaved = 0.0
+        # Break reminder: seconds of continuous work, the limit, and a flag the UI reads.
+        self.work_secs = 0.0
+        self.remind_on = db.get("remind_on", "1") == "1"
+        self.remind_secs = int(db.get("remind_minutes", "60")) * 60
+        self.remind_due = False
+        # Set when the user returns from a real break: (kind, idle_seconds). The UI shows the resume popup.
+        self.resume_event = None
+        # The last 3 snapshots of the open programs (about 30 seconds), used by auto-restore.
+        self.session_ring = deque(maxlen=3)
 
     def stop(self):
         self.stop_flag.set()
@@ -360,9 +466,14 @@ class Tracker(threading.Thread):
         # The user just came back from idle, so store the break that ended.
         if self.was_idle:
             self.was_idle = False
+            kind = break_type(self.idle_started)
             self.db.run("INSERT INTO breaks(ts, idle_secs, kind) VALUES(?, ?, ?)",
-                        (datetime.now().isoformat(timespec="seconds"), self.idle_started,
-                         break_type(self.idle_started)))
+                        (datetime.now().isoformat(timespec="seconds"), self.idle_started, kind))
+            # A real break (5 minutes or more) restarts the work counter and asks for the resume popup.
+            if kind != "short interruption":
+                self.work_secs = 0.0
+                self.remind_due = False
+                self.resume_event = (kind, self.idle_started)
         # Read the active window.
         fg = foreground()
         # Skip when there is no window, or when it belongs to this app.
@@ -374,6 +485,10 @@ class Tracker(threading.Thread):
         if not self.recent or self.recent[-1] != (app, title):
             self.recent.append((app, title))
         self.db.add_usage(day, app, dt)
+        # Count continuous work for the break reminder.
+        self.work_secs += dt
+        if self.remind_on and self.work_secs >= self.remind_secs:
+            self.remind_due = True
         if self.track_titles and title.strip():
             self.db.add_title(day, app, title.strip()[:150], dt)
         self.unsaved += dt
@@ -405,6 +520,14 @@ class Tracker(threading.Thread):
         snap = self.snapshot()
         if snap:
             self.db.set("last_active", json.dumps(snap))
+            self.save_session()
+
+    def save_session(self):
+        # Remembers which programs are open (full exe path) so they can be offered back after a restart.
+        apps = [a for a in visible_apps() if a["app"].lower() not in NO_RESTORE]
+        if apps:
+            self.session_ring.append(apps)
+            self.db.set("session_ring", json.dumps(list(self.session_ring)))
 
 
 # ---------------------------------------------------------------- 5. Lock screen
@@ -600,6 +723,13 @@ class App(tk.Tk):
         self.db = DB()
         # Activity saved by the previous session, shown on the startup lock screen.
         self.prev_snapshot = self.load_json(self.db.get("last_active"))
+        # Programs that were open in the previous session (read before the tracker overwrites them).
+        self.prev_session = pick_session(self.db.get("session_ring"))
+        # Dark or light palette from the saved setting.
+        T.update(DARK_T if self.db.get("dark_mode") == "1" else LIGHT_T)
+        self.configure(bg=T["bg"])
+        # References to the break reminder, resume and restore popups while they are open.
+        self.remind_win = self.resume_win = self.restore_win = None
         # Backend: tracker thread.
         self.tracker = Tracker(self.db)
         self.tracker.start()
@@ -623,6 +753,9 @@ class App(tk.Tk):
         else:
             # First launch without a password: offer to set one.
             self.after(900, self.first_run_prompt)
+        # Without a password there is no unlock step, so offer the restore shortly after startup.
+        if not self.db.has_password():
+            self.after(2500, self.offer_restore)
         # Start the periodic loops.
         self.after(2000, self.tick)
         self.after(500, self.poll_show)
@@ -636,21 +769,26 @@ class App(tk.Tk):
             return None
 
     def style(self):
-        # Sets the ttk theme, colors and fonts.
+        # Sets the ttk theme, colors and fonts from the active palette T (light or dark).
         s = ttk.Style(self)
         s.theme_use("clam")
-        s.configure("TNotebook", background=BG, borderwidth=0)
-        s.configure("TNotebook.Tab", padding=(16, 7), font=("Segoe UI", 10, "bold"),
-                    background=LIGHT, foreground=DARK)
+        bg, fg, card, light = T["bg"], T["fg"], T["card"], T["light"]
+        s.configure("TNotebook", background=bg, borderwidth=0)
+        s.configure("TNotebook.Tab", padding=(16, 7), font=("Segoe UI", 10, "bold"), background=light, foreground=fg)
         s.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "white")])
-        s.configure("TFrame", background=BG)
-        s.configure("TLabel", background=BG, foreground=DARK, font=("Segoe UI", 10))
+        s.configure("TFrame", background=bg)
+        s.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
         s.configure("H.TLabel", font=("Segoe UI", 12, "bold"))
-        s.configure("TButton", font=("Segoe UI", 10), padding=6)
+        s.configure("TButton", font=("Segoe UI", 10), padding=6, background=T["btn"], foreground=fg)
+        s.map("TButton", background=[("active", T["accent_active"])], foreground=[("active", "white")])
         s.configure("Accent.TButton", background=ACCENT, foreground="white")
-        s.map("Accent.TButton", background=[("active", DARK)])
-        s.configure("TCheckbutton", background=BG, foreground=DARK)
-        s.configure("Treeview", rowheight=26, font=("Segoe UI", 10))
+        s.map("Accent.TButton", background=[("active", T["accent_active"])], foreground=[("active", "white")])
+        s.configure("TCheckbutton", background=bg, foreground=fg)
+        s.configure("TRadiobutton", background=bg, foreground=fg)
+        s.configure("TEntry", fieldbackground=card, foreground=fg)
+        s.configure("TSpinbox", fieldbackground=card, foreground=fg)
+        s.configure("Treeview", rowheight=26, font=("Segoe UI", 10), background=card, fieldbackground=card, foreground=fg)
+        s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "white")])
         s.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), background=ACCENT, foreground="white")
 
     def build(self):
@@ -664,7 +802,7 @@ class App(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
         self.tabs = {}
-        for name in ("Dashboard", "Checkpoints", "Usage History", "Files Used", "Settings"):
+        for name in ("Dashboard", "Checkpoints", "Usage History", "Files Used", "Settings", "Features"):
             self.tabs[name] = ttk.Frame(self.notebook)
             self.notebook.add(self.tabs[name], text=name)
         self.build_dashboard(self.tabs["Dashboard"])
@@ -672,6 +810,7 @@ class App(tk.Tk):
         self.build_history(self.tabs["Usage History"])
         self.build_files(self.tabs["Files Used"])
         self.build_settings(self.tabs["Settings"])
+        self.build_features(self.tabs["Features"])
         # Reload the data whenever the user switches tabs.
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
@@ -689,20 +828,30 @@ class App(tk.Tk):
 
     # ---- dashboard
     def build_dashboard(self, f):
-        # Four stat cards, a bar chart canvas and a table of recent checkpoints.
+        # Four stat cards, a chart canvas (today / 7 days / 4 weeks) and a table of recent checkpoints.
         cards = ttk.Frame(f)
         cards.pack(fill="x", padx=10, pady=10)
-        self.stat = {}
+        self.stat, self.stat_boxes = {}, []
         for key in ("Tracked today", "Idle today", "Apps used today", "Last active app"):
-            box = tk.Frame(cards, bg="white", highlightthickness=1, highlightbackground=LIGHT)
+            box = tk.Frame(cards, bg=T["card"], highlightthickness=1, highlightbackground=T["light"])
             box.pack(side="left", expand=True, fill="both", padx=6)
-            tk.Label(box, text=key, bg="white", fg=DARK, font=("Segoe UI", 10)).pack(pady=(10, 0))
-            self.stat[key] = tk.Label(box, text="-", bg="white", fg=ACCENT,
+            title = tk.Label(box, text=key, bg=T["card"], fg=T["fg"], font=("Segoe UI", 10))
+            title.pack(pady=(10, 0))
+            self.stat[key] = tk.Label(box, text="-", bg=T["card"], fg=T["accent_fg"],
                                       font=("Segoe UI", 18, "bold"), wraplength=240)
             self.stat[key].pack(pady=(2, 10))
-        ttk.Label(f, text="Top apps today", style="H.TLabel").pack(anchor="w", padx=12)
+            self.stat_boxes.append((box, title))
+        # Chart title on the left and the chart switch on the right.
+        head = ttk.Frame(f)
+        head.pack(fill="x", padx=12)
+        self.chart_title = ttk.Label(head, text="Top apps today", style="H.TLabel")
+        self.chart_title.pack(side="left")
+        self.chart_mode = tk.StringVar(value="apps")
+        for text, value in (("Last 4 weeks", "weekly"), ("Last 7 days", "daily"), ("Today", "apps")):
+            ttk.Radiobutton(head, text=text, value=value, variable=self.chart_mode,
+                            command=self.refresh_dashboard).pack(side="right", padx=6)
         # The bar chart is drawn by hand on this canvas.
-        self.bars = tk.Canvas(f, bg="white", height=230, highlightthickness=1, highlightbackground=LIGHT)
+        self.bars = tk.Canvas(f, bg=T["card"], height=230, highlightthickness=1, highlightbackground=T["light"])
         self.bars.pack(fill="x", padx=12, pady=6)
         ttk.Label(f, text="Recent checkpoints", style="H.TLabel").pack(anchor="w", padx=12)
         self.dash_cp = ttk.Treeview(f, columns=("time", "project", "note"), show="headings", height=4)
@@ -725,11 +874,23 @@ class App(tk.Tk):
         self.status.config(text="Tracking: " + ("PAUSED" if t.paused else "ON"))
         self.pause_btn.config(text="Start tracking" if t.paused else "Pause tracking")
 
-        # Redraw the bar chart from scratch.
-        self.bars.delete("all")
-        if not rows:
-            self.bars.create_text(20, 20, anchor="nw", fill=DARK, text="No data yet - use some apps.")
-        else:
+        self.draw_chart(rows)
+        clear_tree(self.dash_cp)
+        cps = self.db.query("SELECT ts, project, note FROM checkpoints ORDER BY id DESC LIMIT 4")
+        if not cps:
+            self.dash_cp.insert("", "end", values=("", "", "No checkpoints yet. Use the Checkpoints tab."))
+        for ts, project, note in cps:
+            self.dash_cp.insert("", "end", values=(ts, project, (note or "").replace("\n", " ")[:90]))
+
+    def draw_chart(self, rows):
+        # Draws the dashboard chart: top apps today, daily usage (7 days) or weekly usage (4 weeks).
+        c, mode, fg = self.bars, self.chart_mode.get(), T["fg"]
+        c.delete("all")
+        if mode == "apps":
+            self.chart_title.config(text="Top apps today")
+            if not rows:
+                c.create_text(20, 20, anchor="nw", fill=fg, text="No data yet - use some apps.")
+                return
             # The app with the most seconds gets the full bar width.
             top = rows[0][1] or 1
             # Show only the top 8 apps.
@@ -737,16 +898,45 @@ class App(tk.Tk):
                 y = 10 + i * 27
                 # Bar width is proportional to the seconds.
                 width = max(4, int(secs / top * 430))
-                self.bars.create_text(10, y + 11, anchor="w", text=app, fill=DARK, font=("Segoe UI", 9))
-                self.bars.create_rectangle(170, y, 170 + width, y + 22, fill=ACCENT, outline="")
-                self.bars.create_text(178 + width, y + 11, anchor="w", text=fmt_secs(secs),
-                                      fill=DARK, font=("Segoe UI", 9))
-        clear_tree(self.dash_cp)
-        cps = self.db.query("SELECT ts, project, note FROM checkpoints ORDER BY id DESC LIMIT 4")
-        if not cps:
-            self.dash_cp.insert("", "end", values=("", "", "No checkpoints yet. Use the Checkpoints tab."))
-        for ts, project, note in cps:
-            self.dash_cp.insert("", "end", values=(ts, project, (note or "").replace("\n", " ")[:90]))
+                c.create_text(10, y + 11, anchor="w", text=app, fill=fg, font=("Segoe UI", 9))
+                c.create_rectangle(170, y, 170 + width, y + 22, fill=ACCENT, outline="")
+                c.create_text(178 + width, y + 11, anchor="w", text=fmt_secs(secs), fill=fg, font=("Segoe UI", 9))
+            return
+        days = 7 if mode == "daily" else 28
+        start = date.today() - timedelta(days=days - 1)
+        # Seconds per day over the period, with system apps and idle time left out.
+        data = dict(self.db.query("SELECT day, SUM(seconds) FROM usage WHERE day >= ? AND " + SYS_CLAUSE +
+                                  " GROUP BY day", (start.isoformat(),) + SYSTEM_APPS))
+        if mode == "daily":
+            self.chart_title.config(text="Daily usage - last 7 days")
+            cols = []
+            for i in range(7):
+                d = start + timedelta(days=i)
+                cols.append((d.strftime("%a %d"), data.get(d.isoformat(), 0)))
+        else:
+            self.chart_title.config(text="Weekly usage - last 4 weeks")
+            cols = []
+            for w in range(4):
+                first = start + timedelta(days=7 * w)
+                last = first + timedelta(days=6)
+                total = sum(data.get((first + timedelta(days=i)).isoformat(), 0) for i in range(7))
+                cols.append(("%s - %s" % (first.strftime("%d %b"), last.strftime("%d %b")), total))
+        peak = max(v for _, v in cols)
+        if peak <= 0:
+            c.create_text(20, 20, anchor="nw", fill=fg, text="No data in this period yet.")
+            return
+        width, base = max(c.winfo_width(), 640), 200
+        slot = (width - 40) / len(cols)
+        c.create_line(20, base, width - 20, base, fill=T["light"])
+        for i, (label, secs) in enumerate(cols):
+            x0, x1 = 30 + i * slot + slot * 0.18, 30 + i * slot + slot * 0.82
+            top = base - max(2, int(secs / peak * 150)) if secs else base - 2
+            c.create_rectangle(x0, top, x1, base, fill=ACCENT, outline="")
+            c.create_text((x0 + x1) / 2, top - 9, text=fmt_secs(secs) if secs else "0", fill=fg, font=("Segoe UI", 9))
+            c.create_text((x0 + x1) / 2, base + 14, text=label, fill=fg, font=("Segoe UI", 9))
+        total = sum(v for _, v in cols)
+        c.create_text(10, 6, anchor="nw", fill=fg, font=("Segoe UI", 9),
+                      text="Total %s    Average per day %s" % (fmt_secs(total), fmt_secs(total / days)))
 
     # ---- checkpoints
     def build_checkpoints(self, f):
@@ -757,10 +947,10 @@ class App(tk.Tk):
         self.cp_project = ttk.Entry(form, width=60)
         self.cp_project.pack(fill="x", pady=(0, 6))
         ttk.Label(form, text="Note (what you were doing)").pack(anchor="w")
-        self.cp_note = tk.Text(form, height=3, font=("Segoe UI", 10))
+        self.cp_note = tk.Text(form, height=3, font=("Segoe UI", 10), bg=T["card"], fg=T["fg"], insertbackground=T["fg"])
         self.cp_note.pack(fill="x", pady=(0, 6))
         ttk.Label(form, text="Next step (to resume later)").pack(anchor="w")
-        self.cp_next = tk.Text(form, height=2, font=("Segoe UI", 10))
+        self.cp_next = tk.Text(form, height=2, font=("Segoe UI", 10), bg=T["card"], fg=T["fg"], insertbackground=T["fg"])
         self.cp_next.pack(fill="x", pady=(0, 6))
         ttk.Button(form, text="Save checkpoint", style="Accent.TButton", command=self.save_checkpoint).pack(anchor="w")
 
@@ -837,9 +1027,10 @@ class App(tk.Tk):
         now_titles = [title for _, title in list(self.tracker.recent)]
         win = tk.Toplevel(self)
         win.title("Resume - " + (project or "checkpoint"))
-        win.configure(bg=BG)
+        win.configure(bg=T["bg"])
         win.geometry("600x520")
-        text = tk.Text(win, wrap="word", font=("Segoe UI", 10), padx=10, pady=10)
+        text = tk.Text(win, wrap="word", font=("Segoe UI", 10), padx=10, pady=10,
+                       bg=T["card"], fg=T["fg"])
         text.pack(fill="both", expand=True, padx=10, pady=10)
         # The keywords (TF-IDF) and similarity (cosine) helpers are used here.
         body = ("Context only - apps are NOT reopened.\n\n"
@@ -861,21 +1052,39 @@ class App(tk.Tk):
             self.refresh_dashboard()
 
     # ---- usage history and files used
-    def filter_row(self, parent, fields, on_show):
-        # Reusable filter bar with labeled entry boxes and a Show button.
+    def filter_row(self, parent, fields, on_show, extra=()):
+        # Reusable filter bar with labeled entry boxes, a Show button and optional extra buttons.
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=12, pady=10)
         for i, (label, var) in enumerate(fields):
             ttk.Label(bar, text=label).grid(row=0, column=i, sticky="w", padx=8)
-            ttk.Entry(bar, textvariable=var, width=18).grid(row=1, column=i, padx=8)
+            entry = ttk.Entry(bar, textvariable=var, width=18)
+            entry.grid(row=1, column=i, padx=8)
+            # Pressing Enter works the same as clicking Show.
+            entry.bind("<Return>", lambda e: on_show())
         ttk.Button(bar, text="Show", style="Accent.TButton", command=on_show).grid(row=1, column=len(fields), padx=8)
+        for j, (text, command) in enumerate(extra, start=1):
+            ttk.Button(bar, text=text, command=command).grid(row=1, column=len(fields) + j, padx=4)
+
+    def search_all_days(self, from_var, to_var, table, loader):
+        # Sets the date range from the first recorded day to today and runs the search.
+        first = self.db.query("SELECT MIN(day) FROM " + table)[0][0]
+        from_var.set(first or date.today().isoformat())
+        to_var.set(date.today().isoformat())
+        loader()
+
+    def history_all_days(self):
+        self.search_all_days(self.h_from, self.h_to, "usage", self.load_history)
+
+    def files_all_days(self):
+        self.search_all_days(self.f_from, self.f_to, "titles", self.load_files)
 
     def build_history(self, f):
         # Usage History tab: date range and app filter above a results table.
         today = date.today().isoformat()
         self.h_from, self.h_to, self.h_app = tk.StringVar(value=today), tk.StringVar(value=today), tk.StringVar()
         self.filter_row(f, [("From (YYYY-MM-DD)", self.h_from), ("To", self.h_to), ("App contains", self.h_app)],
-                        self.load_history)
+                        self.load_history, extra=[("All days", self.history_all_days)])
         self.h_total = ttk.Label(f, text="", style="H.TLabel")
         self.h_total.pack(anchor="w", padx=12)
         self.h_tree = ttk.Treeview(f, columns=("day", "app", "time"), show="headings")
@@ -900,7 +1109,8 @@ class App(tk.Tk):
         today = date.today().isoformat()
         self.f_from, self.f_to, self.f_text = tk.StringVar(value=today), tk.StringVar(value=today), tk.StringVar()
         self.filter_row(f, [("From (YYYY-MM-DD)", self.f_from), ("To", self.f_to),
-                            ("App or file name contains", self.f_text)], self.load_files)
+                            ("App or file name contains", self.f_text)], self.load_files,
+                        extra=[("Search all days", self.files_all_days)])
         self.f_total = ttk.Label(f, text="", style="H.TLabel")
         self.f_total.pack(anchor="w", padx=12)
         self.f_warn = ttk.Label(f, text="", foreground="#b03040")
@@ -924,7 +1134,10 @@ class App(tk.Tk):
                              (self.f_from.get().strip(), self.f_to.get().strip(), term, term) + SYSTEM_APPS)
         for day, app, title, secs in rows:
             self.f_tree.insert("", "end", values=(day, app, title, fmt_secs(secs)))
-        self.f_total.config(text="%d files / windows" % len(rows))
+        days = len({r[0] for r in rows})
+        note = "  (first 1000 shown)" if len(rows) == 1000 else ""
+        self.f_total.config(text="%d files / windows on %d day(s), total %s%s"
+                            % (len(rows), days, fmt_secs(sum(r[3] for r in rows)), note))
 
     # ---- settings
     def build_settings(self, f):
@@ -946,6 +1159,8 @@ class App(tk.Tk):
         self.titles_var = tk.BooleanVar(value=self.db.get("track_titles", "1") == "1")
         ttk.Checkbutton(f, text="Record file / window names (Files Used tab)", variable=self.titles_var,
                         command=self.toggle_titles).pack(**pad)
+        self.dark_var = tk.BooleanVar(value=self.db.get("dark_mode") == "1")
+        ttk.Checkbutton(f, text="Dark mode", variable=self.dark_var, command=self.toggle_dark).pack(**pad)
 
         ttk.Label(f, text="Password & lock screen", style="H.TLabel").pack(**pad)
         row = ttk.Frame(f)
@@ -1052,9 +1267,9 @@ class App(tk.Tk):
         result = {"value": None}
         win = tk.Toplevel(self)
         win.title(APP)
-        win.configure(bg=BG)
+        win.configure(bg=T["bg"])
         win.resizable(False, False)
-        tk.Label(win, text=prompt, bg=BG, fg=DARK, font=("Segoe UI", 10)).pack(padx=20, pady=(16, 6))
+        tk.Label(win, text=prompt, bg=T["bg"], fg=T["fg"], font=("Segoe UI", 10)).pack(padx=20, pady=(16, 6))
         entry = tk.Entry(win, show="*", width=28, font=("Segoe UI", 11))
         entry.pack(padx=20, pady=4)
 
@@ -1062,7 +1277,7 @@ class App(tk.Tk):
             result["value"] = entry.get()
             win.destroy()
 
-        row = tk.Frame(win, bg=BG)
+        row = tk.Frame(win, bg=T["bg"])
         row.pack(pady=12)
         tk.Button(row, text="OK", width=9, bg=ACCENT, fg="white", command=ok).pack(side="left", padx=5)
         tk.Button(row, text="Cancel", width=9, command=win.destroy).pack(side="left", padx=5)
@@ -1135,10 +1350,14 @@ class App(tk.Tk):
     def lock_closed(self, reason):
         # Called after the lock screen is unlocked. Restores the main window.
         self.lock_win = None
+        # The unlock screen already showed the last checkpoint, so no resume popup is needed now.
+        self.tracker.resume_event = None
         if reason == "startup":
             self.deiconify()
             if self.start_minimized:
                 self.iconify()
+            # The user has unlocked, so offer to reopen the programs of the last session.
+            self.after(400, self.offer_restore)
         elif self.was_normal:
             self.deiconify()
 
@@ -1193,6 +1412,207 @@ class App(tk.Tk):
             self.db.backup(path)
             messagebox.showinfo(APP, "Backup saved." + PRIVACY_NOTE)
 
+    # ---- dark mode
+    def toggle_dark(self):
+        # Saves the dark mode choice and re-colors the window at once.
+        self.db.set("dark_mode", int(self.dark_var.get()))
+        self.apply_theme()
+
+    def apply_theme(self):
+        # Re-colors the whole main window after the dark mode switch changed.
+        T.clear()
+        T.update(DARK_T if self.db.get("dark_mode") == "1" else LIGHT_T)
+        self.configure(bg=T["bg"])
+        self.style()
+        for box, title in self.stat_boxes:
+            box.config(bg=T["card"], highlightbackground=T["light"])
+            title.config(bg=T["card"], fg=T["fg"])
+        for label in self.stat.values():
+            label.config(bg=T["card"], fg=T["accent_fg"])
+        self.bars.config(bg=T["card"], highlightbackground=T["light"])
+        for box in (self.cp_note, self.cp_next):
+            box.config(bg=T["card"], fg=T["fg"], insertbackground=T["fg"])
+        self.refresh_dashboard()
+
+    # ---- features tab (break reminder, resume popup, auto-restore)
+    def build_features(self, f):
+        pad = dict(padx=14, pady=6, anchor="w")
+        self.remind_var = tk.BooleanVar(value=self.db.get("remind_on", "1") == "1")
+        self.remind_min = tk.IntVar(value=int(self.db.get("remind_minutes", "60")))
+        self.resume_var = tk.BooleanVar(value=self.db.get("resume_on", "1") == "1")
+        self.restore_var = tk.BooleanVar(value=self.db.get("restore_on", "1") == "1")
+
+        ttk.Label(f, text="Break reminder", style="H.TLabel").pack(**pad)
+        row = ttk.Frame(f)
+        row.pack(**pad)
+        ttk.Checkbutton(row, text="Remind me to take a break after", variable=self.remind_var,
+                        command=self.save_features).pack(side="left")
+        ttk.Spinbox(row, from_=15, to=240, width=4, textvariable=self.remind_min,
+                    command=self.save_features).pack(side="left", padx=4)
+        self.remind_min.trace_add("write", lambda *a: self.save_features())
+        ttk.Label(row, text="minutes of continuous work").pack(side="left")
+        ttk.Label(f, text="A break of 5 minutes or more resets the counter.", foreground="#7a6a9a").pack(**pad)
+
+        ttk.Label(f, text="Resume popup", style="H.TLabel").pack(**pad)
+        ttk.Checkbutton(f, text="When I return from a break (5 min or more), show where I stopped and my next step",
+                        variable=self.resume_var, command=self.save_features).pack(**pad)
+        ttk.Label(f, text="Not shown when the lock screen is used, because the lock screen already shows it.",
+                  foreground="#7a6a9a").pack(**pad)
+
+        ttk.Label(f, text="Auto-restore last session", style="H.TLabel").pack(**pad)
+        ttk.Checkbutton(f, text="After a restart, offer to reopen the programs I was using",
+                        variable=self.restore_var, command=self.save_features).pack(**pad)
+        ttk.Button(f, text="Restore previous session now", command=lambda: self.offer_restore(force=True)).pack(**pad)
+        ttk.Label(f, text="Programs are reopened only after you unlock and approve them. File names and tabs are\n"
+                          "not restored by ContextMind: VS Code and Chrome reopen their own last workspace and tabs.",
+                  foreground="#7a6a9a", justify="left").pack(**pad)
+
+    def save_features(self):
+        # Saves the feature options and applies them to the tracker immediately.
+        try:
+            minutes = max(15, int(self.remind_min.get()))
+        except (ValueError, tk.TclError):
+            return
+        self.db.set("remind_on", int(self.remind_var.get()))
+        self.db.set("remind_minutes", minutes)
+        self.db.set("resume_on", int(self.resume_var.get()))
+        self.db.set("restore_on", int(self.restore_var.get()))
+        self.tracker.remind_on = self.remind_var.get()
+        self.tracker.remind_secs = minutes * 60
+
+    def popup(self, title, attr):
+        # Creates a small always-on-top popup window and remembers it in self.<attr> while it is open.
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=T["bg"])
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        setattr(self, attr, win)
+
+        def close():
+            setattr(self, attr, None)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        return win, close
+
+    def check_notices(self):
+        """Shows the break reminder and the resume popup that the tracker asked for."""
+        t = self.tracker
+        # While the lock screen is open the user is away or unlocking, so nothing is shown.
+        if self.lock_win is not None:
+            t.resume_event = None
+            return
+        event, t.resume_event = t.resume_event, None
+        if event and self.db.get("resume_on", "1") == "1" and self.resume_win is None:
+            self.show_resume_popup(*event)
+        if t.remind_due and t.remind_on and self.remind_win is None:
+            t.remind_due = False
+            self.show_break_reminder()
+
+    # ---- break reminder
+    def show_break_reminder(self):
+        minutes = int(self.tracker.work_secs // 60)
+        win, close = self.popup("Take a break", "remind_win")
+        tk.Label(win, text="Time for a break", bg=ACCENT, fg="white", font=("Segoe UI", 13, "bold"),
+                 padx=20, pady=10).pack(fill="x")
+        tk.Label(win, text="You have worked for %d minutes without a real break.\n"
+                           "Stand up, stretch and rest your eyes." % minutes,
+                 bg=T["bg"], fg=T["fg"], font=("Segoe UI", 10), padx=20, pady=14).pack()
+
+        def took_break():
+            self.tracker.work_secs = 0.0
+            close()
+
+        def snooze():
+            # Remind again in 10 minutes.
+            self.tracker.work_secs = max(0.0, self.tracker.remind_secs - 600)
+            close()
+
+        row = tk.Frame(win, bg=T["bg"])
+        row.pack(pady=(0, 14))
+        ttk.Button(row, text="OK, taking a break", style="Accent.TButton", command=took_break).pack(side="left", padx=6)
+        ttk.Button(row, text="Snooze 10 min", command=snooze).pack(side="left", padx=6)
+        win.protocol("WM_DELETE_WINDOW", took_break)
+        win.bell()
+
+    # ---- resume popup
+    def show_resume_popup(self, kind, idle_secs):
+        cp = self.db.query("SELECT ts, project, note, next_step FROM checkpoints ORDER BY id DESC LIMIT 1")
+        apps = self.tracker.context(4)
+        win, close = self.popup("Welcome back", "resume_win")
+        tk.Label(win, text="Welcome back - %s (%s away)" % (kind, fmt_secs(idle_secs)), bg=ACCENT, fg="white",
+                 font=("Segoe UI", 12, "bold"), padx=20, pady=10).pack(fill="x")
+        lines = []
+        if cp:
+            ts, project, note, nxt = cp[0]
+            lines += ["Last time you were on: %s  (saved %s)" % (project or "-", ago(ts) or ts),
+                      "Note: %s" % (note or "-").replace("\n", " ")[:160],
+                      "Next step: %s" % (nxt or "-").replace("\n", " ")[:160]]
+        else:
+            lines.append("No checkpoint saved yet. Save one in the Checkpoints tab before your next break.")
+        if apps:
+            lines += ["", "Apps you were using:"] + ["   %s  -  %s" % (a["app"], a["title"][:55]) for a in apps]
+        tk.Label(win, text="\n".join(lines), bg=T["bg"], fg=T["fg"], justify="left", anchor="w",
+                 wraplength=480, font=("Segoe UI", 10), padx=20, pady=14).pack(anchor="w")
+
+        def open_checkpoints():
+            self.deiconify()
+            self.notebook.select(self.tabs["Checkpoints"])
+            close()
+
+        row = tk.Frame(win, bg=T["bg"])
+        row.pack(pady=(0, 14))
+        ttk.Button(row, text="Continue", style="Accent.TButton", command=close).pack(side="left", padx=6)
+        ttk.Button(row, text="Open checkpoints", command=open_checkpoints).pack(side="left", padx=6)
+
+    # ---- auto-restore last session
+    def offer_restore(self, force=False):
+        """Asks the user which programs of the previous session to reopen. Nothing starts without approval."""
+        if self.restore_win is not None:
+            return
+        if not force and self.db.get("restore_on", "1") != "1":
+            return
+        apps = restorable(self.prev_session)[:15]
+        if not apps:
+            if force:
+                messagebox.showinfo(APP, "Nothing to restore. The programs of the previous session are already open "
+                                         "or no session was saved.")
+            return
+        win, close = self.popup("Restore last session?", "restore_win")
+        tk.Label(win, text="Restore your last session?", bg=ACCENT, fg="white", font=("Segoe UI", 12, "bold"),
+                 padx=20, pady=10).pack(fill="x")
+        tk.Label(win, text="These programs were open before. Tick the ones to reopen.", bg=T["bg"], fg=T["fg"],
+                 font=("Segoe UI", 10), padx=20, pady=8).pack(anchor="w")
+        picks = []
+        for item in apps:
+            var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(win, text="%s  -  %s" % (item["app"], item["title"][:50]), variable=var).pack(anchor="w", padx=24)
+            picks.append((item, var))
+
+        def restore():
+            chosen = [item for item, var in picks if var.get()]
+            started = self.launch_apps(chosen)
+            close()
+            messagebox.showinfo(APP, "Reopened %d of %d program(s)." % (started, len(chosen)))
+
+        row = tk.Frame(win, bg=T["bg"])
+        row.pack(pady=14)
+        ttk.Button(row, text="Restore selected", style="Accent.TButton", command=restore).pack(side="left", padx=6)
+        ttk.Button(row, text="Skip", command=close).pack(side="left", padx=6)
+
+    @staticmethod
+    def launch_apps(apps):
+        # Starts each program file. A program that cannot start is logged and skipped.
+        started = 0
+        for item in apps:
+            try:
+                subprocess.Popen([item["exe"]], cwd=os.path.dirname(item["exe"]) or None)
+                started += 1
+            except (OSError, ValueError):
+                logging.exception("restore %s", item.get("exe"))
+        return started
+
     # ---- loop and quit
     def tick(self):
         """Every 2 seconds: check idle lock, keep lock screen on top, refresh dashboard."""
@@ -1211,6 +1631,7 @@ class App(tk.Tk):
                     # Also lock the Windows session itself.
                     lock_windows()
                 self.show_lock("idle")
+            self.check_notices()
             # Refresh the dashboard every third tick, only while the window is visible.
             if self.tick_count % 3 == 0 and self.lock_win is None and self.state() == "normal":
                 self.refresh_dashboard()
