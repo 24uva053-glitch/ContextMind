@@ -166,6 +166,28 @@ def ago(iso):
 
 def clear_tree(tree):
     tree.delete(*tree.get_children())
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_command(show):
+    flag = "" if show else " --minimized"
+    if getattr(sys, "frozen", False):
+        return '"%s"%s' % (sys.executable, flag)
+    pyw = sys.executable.replace("python.exe", "pythonw.exe")
+    return '"%s" "%s"%s' % (pyw, os.path.abspath(__file__), flag)
+
+
+def autostart_registered():
+    if not IS_WIN:
+        return ""
+    import winreg
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY)
+        value = winreg.QueryValueEx(key, APP)[0]
+        winreg.CloseKey(key)
+        return value
+    except OSError:
+        return ""
 
 
 def pick_session(text):
@@ -555,8 +577,14 @@ class App(tk.Tk):
             self.iconify()
         else:
             self.after(900, self.first_run_prompt)
+        if IS_WIN and self.db.get("autostart") == "1":
+            try:
+                self.write_autostart(True)
+            except OSError:
+                logging.exception("autostart refresh")
         if not self.db.has_password():
             self.after(2500, self.offer_restore)
+            self.after(4500, self.ask_autostart)
         self.after(2000, self.tick)
         self.after(500, self.poll_show)
     @staticmethod
@@ -952,34 +980,49 @@ class App(tk.Tk):
         self.db.set("track_titles", int(on))
         self.tracker.track_titles = on
         self.load_files()
+    def write_autostart(self, on):
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if on:
+                winreg.SetValueEx(key, APP, 0, winreg.REG_SZ,
+                                  autostart_command(self.db.get("startup_show", "1") == "1"))
+            else:
+                try:
+                    winreg.DeleteValue(key, APP)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
     def toggle_autostart(self):
         on = self.autostart_var.get()
         if not IS_WIN:
             messagebox.showinfo(APP, "This option works on Windows only.")
             self.autostart_var.set(False)
             return
-        import winreg
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
-            if on:
-                if getattr(sys, "frozen", False):
-                    cmd = '"%s" --minimized' % sys.executable
-                else:
-                    pyw = sys.executable.replace("python.exe", "pythonw.exe")
-                    cmd = '"%s" "%s" --minimized' % (pyw, os.path.abspath(__file__))
-                winreg.SetValueEx(key, APP, 0, winreg.REG_SZ, cmd)
-            else:
-                try:
-                    winreg.DeleteValue(key, APP)
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
+            self.write_autostart(on)
             self.db.set("autostart", int(on))
         except OSError as ex:
             logging.exception("autostart")
             messagebox.showerror(APP, "Startup setting failed: %s" % ex)
             self.autostart_var.set(not on)
+        self.update_session_info()
+    def toggle_startup_show(self):
+        self.db.set("startup_show", int(self.show_var.get()))
+        if IS_WIN and self.db.get("autostart") == "1":
+            try:
+                self.write_autostart(True)
+            except OSError:
+                logging.exception("autostart")
+    def ask_autostart(self):
+        if not IS_WIN or self.db.get("autostart") == "1" or self.db.get("asked_autostart") == "1":
+            return
+        self.db.set("asked_autostart", "1")
+        if messagebox.askyesno(APP, "Start ContextMind automatically when Windows starts?\n\n"
+                                    "This is needed so the restore popup appears after a restart."):
+            self.autostart_var.set(True)
+            self.toggle_autostart()
     def ask_secret(self, prompt):
         result = {"value": None}
         win = tk.Toplevel(self)
@@ -1056,6 +1099,7 @@ class App(tk.Tk):
             if self.start_minimized:
                 self.iconify()
             self.after(400, self.offer_restore)
+            self.after(1500, self.ask_autostart)
         elif self.was_normal:
             self.deiconify()
     def export_csv(self, name, header, query):
@@ -1116,7 +1160,7 @@ class App(tk.Tk):
             box.config(bg=T["card"], fg=T["fg"], insertbackground=T["fg"])
         self.refresh_dashboard()
     def build_features(self, f):
-        pad = dict(padx=14, pady=6, anchor="w")
+        pad = dict(padx=14, pady=4, anchor="w")
         self.remind_var = tk.BooleanVar(value=self.db.get("remind_on", "1") == "1")
         self.remind_min = tk.IntVar(value=int(self.db.get("remind_minutes", "60")))
         self.resume_var = tk.BooleanVar(value=self.db.get("resume_on", "1") == "1")
@@ -1139,6 +1183,11 @@ class App(tk.Tk):
         ttk.Label(f, text="Auto-restore last session", style="H.TLabel").pack(**pad)
         ttk.Checkbutton(f, text="After a restart, offer to reopen the programs I was using",
                         variable=self.restore_var, command=self.save_features).pack(**pad)
+        ttk.Checkbutton(f, text="Start ContextMind when Windows starts (needed for auto-restore)",
+                        variable=self.autostart_var, command=self.toggle_autostart).pack(**pad)
+        self.show_var = tk.BooleanVar(value=self.db.get("startup_show", "1") == "1")
+        ttk.Checkbutton(f, text="Show the ContextMind window when Windows starts", variable=self.show_var,
+                        command=self.toggle_startup_show).pack(**pad)
         ttk.Button(f, text="Restore previous session now", command=lambda: self.offer_restore(force=True)).pack(**pad)
         self.session_info = ttk.Label(f, text="", foreground="#7a6a9a", justify="left")
         self.session_info.pack(**pad)
@@ -1159,9 +1208,11 @@ class App(tk.Tk):
     def update_session_info(self):
         now = pick_session(self.db.get("session_ring"))
         names = ", ".join(a["app"] for a in now[:6]) or "none"
-        self.session_info.config(text="Saved now: %d program(s) (%s)\nFrom the previous start: %d program(s), "
-                                      "%d can be restored" % (len(now), names, len(self.prev_session),
-                                                              len(restorable(self.prev_session))))
+        startup = "ON" if autostart_registered() else "OFF"
+        self.session_info.config(text="Windows startup: %s\nSaved now: %d program(s) (%s)\n"
+                                      "From the previous start: %d program(s), %d can be restored"
+                                      % (startup, len(now), names, len(self.prev_session),
+                                         len(restorable(self.prev_session))))
     def popup(self, title, attr):
         win = tk.Toplevel(self)
         win.title(title)
